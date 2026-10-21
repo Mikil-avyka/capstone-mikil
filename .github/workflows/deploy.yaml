@@ -52,8 +52,31 @@ on:
 permissions: {}
 
 jobs:
+  # catch a mistyped or pasted tag (e.g. a stray space) before anyone is asked to approve it
+  validate:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Check image tags
+        env:
+          BACKEND_TAG: ${{ inputs.backend_tag }}
+          FRONTEND_TAG: ${{ inputs.frontend_tag }}
+        run: |
+          check() {
+            if [[ ! "$2" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "::error::${1} tag '${2}' is not a valid image tag (check for spaces or typos)"
+              return 1
+            fi
+          }
+          status=0
+          check backend "$BACKEND_TAG" || status=1
+          check frontend "$FRONTEND_TAG" || status=1
+          exit "$status"
+
   approval:
     name: Approval
+    needs: validate
     if: inputs.enable_approval
     runs-on: ubuntu-latest
     # the job waits here until a required reviewer of this environment approves
@@ -70,9 +93,9 @@ jobs:
 
   deploy-backend:
     name: Deploy Backend
-    needs: approval
+    needs: [validate, approval]
     # run after approval, or straight away when approval is disabled
-    if: ${{ !cancelled() && (needs.approval.result == 'success' || needs.approval.result == 'skipped') }}
+    if: ${{ !cancelled() && needs.validate.result == 'success' && (needs.approval.result == 'success' || needs.approval.result == 'skipped') }}
     uses: ./.github/workflows/reusable-k8s-deploy.yaml
     permissions:
       contents: read
