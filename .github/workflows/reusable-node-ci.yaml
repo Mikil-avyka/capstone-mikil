@@ -1,0 +1,347 @@
+---
+name: Reusable Node CI and Security Scans
+# GitHub Actions equivalent of the Harness pipelines "Mikil Backend CI" (mikil_backend_ci)
+# and "Mikil Frontend CI" (mikil_frontend_ci), which differ only by service and image repo.
+#
+#   Harness Build stage    -> lint + test (parallel), then build-push
+#   Harness Security stage -> semgrep + owasp + trivy (parallel); each has
+#                             fail_on_severity=critical and failure strategy "Ignore",
+#                             which maps to job-level continue-on-error.
+#
+# Scan results go to GitHub Code Scanning (Security tab) in place of the Harness STO dashboard.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Service folder to build (backend or frontend)
+        required: true
+        type: string
+      image_repo:
+        description: Docker Hub repository to push to (e.g. mikilavyka/capstone_backend)
+        required: true
+        type: string
+      node_version:
+        description: Node.js version for lint and test
+        required: false
+        type: string
+        default: "20"
+      enable_lint:
+        description: Harness stage variable ENABLE_LINT
+        required: false
+        type: boolean
+        default: true
+      enable_test:
+        description: Harness stage variable ENABLE_TEST
+        required: false
+        type: boolean
+        default: true
+      enable_sto_scans:
+        description: Harness stage variable ENABLE_STO_SCANS
+        required: false
+        type: boolean
+        default: true
+      image_tag:
+        description: Image tag to push (default is <service>-<run number>-<short sha>)
+        required: false
+        type: string
+        default: ""
+    secrets:
+      DOCKERHUB_TOKEN:
+        description: Docker Hub access token (replaces Harness secret mikil_dockerhub_secret)
+        required: true
+      NVD_API_KEY:
+        description: Optional NVD API key; without it the Dependency-Check database download is very slow
+        required: false
+    outputs:
+      image_tag:
+        description: The image tag that was pushed
+        value: ${{ jobs.build-push.outputs.image_tag }}
+
+# reset permissions to none at the workflow level and grant them per job
+# calling workflows must grant at least what these jobs request
+permissions: {}
+
+env:
+  SEMGREP_VERSION: "1.180.0"
+  DEPENDENCY_CHECK_IMAGE: owasp/dependency-check:13.0.0@sha256:0e8f69ad5b00d62000937f4e57189812343f6903d9c83ee712012d51542a020a
+  TRIVY_IMAGE: aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+
+jobs:
+  # ---------------------------------------------------------------- Build stage
+  lint:
+    name: Lint
+    if: inputs.enable_lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.service }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.service }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+  test:
+    name: Test
+    if: inputs.enable_test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.service }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.service }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+  build-push:
+    name: Build and Push
+    needs: [lint, test]
+    # lint and test may be skipped by their toggles, but a failure in either blocks the push
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Harness tagged images <service>-<pipeline sequenceId>; the short sha suffix keeps
+      # tags unique when different workflows share a run number
+      - name: Compute image tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.image_tag }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          tag="${INPUT_TAG:-${SERVICE}-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}}"
+          echo "image_tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${tag}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.service }}
+          push: true
+          tags: ${{ inputs.image_repo }}:${{ steps.tag.outputs.image_tag }}
+          # equivalent of the Harness "caching: true" on BuildAndPushDockerRegistry
+          cache-from: type=gha,scope=${{ inputs.service }}
+          cache-to: type=gha,scope=${{ inputs.service }},mode=max,ignore-error=true
+
+  # ------------------------------------------------------------- Security stage
+  semgrep:
+    name: Semgrep (SAST)
+    needs: build-push
+    if: inputs.enable_sto_scans
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Semgrep
+        run: pipx install "semgrep==${SEMGREP_VERSION}"
+
+      # p/default is the Semgrep default ruleset (Harness "config: default"). Semgrep severities
+      # never map to "critical", so like Harness this scan reports findings without failing
+      - name: Run Semgrep
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: semgrep scan --config p/default --metrics off --sarif --output semgrep.sarif "$SERVICE"
+
+      - name: Upload SARIF to Code Scanning
+        if: ${{ !cancelled() && hashFiles('semgrep.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep-${{ inputs.service }}
+
+      - name: Upload report
+        if: ${{ !cancelled() && hashFiles('semgrep.sarif') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: semgrep-${{ inputs.service }}
+          path: semgrep.sarif
+
+  owasp:
+    name: OWASP Dependency-Check (SCA)
+    needs: build-push
+    if: inputs.enable_sto_scans
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compute cache week
+        id: week
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      # the NVD database is large; cache it and refresh it incrementally
+      - name: Cache Dependency-Check data
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/dependency-check-data
+          key: dependency-check-data-${{ steps.week.outputs.week }}
+          restore-keys: dependency-check-data-
+
+      # --disableOssIndex matches the Harness step args; --failOnCVSS 9 is fail_on_severity=critical.
+      # The repo is mounted at the same path inside the container so SARIF paths line up with the checkout
+      - name: Run Dependency-Check
+        env:
+          SERVICE: ${{ inputs.service }}
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          data_dir="${RUNNER_TEMP}/dependency-check-data"
+          report_dir="${GITHUB_WORKSPACE}/dependency-check-report"
+          mkdir -p "$data_dir" "$report_dir"
+          args=(
+            --project "capstone-${SERVICE}"
+            --scan "${GITHUB_WORKSPACE}/${SERVICE}"
+            --out "$report_dir"
+            --format SARIF --format HTML
+            --disableOssIndex
+            --failOnCVSS 9
+          )
+          if [ -n "$NVD_API_KEY" ]; then
+            args+=(--nvdApiKey "$NVD_API_KEY")
+          else
+            echo "::warning::NVD_API_KEY is not set; the NVD database download will be slow"
+          fi
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --volume "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" \
+            --volume "${data_dir}:/usr/share/dependency-check/data" \
+            "$DEPENDENCY_CHECK_IMAGE" "${args[@]}"
+
+      - name: Upload SARIF to Code Scanning
+        if: ${{ !cancelled() && hashFiles('dependency-check-report/dependency-check-report.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: dependency-check-report/dependency-check-report.sarif
+          category: owasp-${{ inputs.service }}
+
+      - name: Upload report
+        if: ${{ !cancelled() && hashFiles('dependency-check-report/*') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dependency-check-${{ inputs.service }}
+          path: dependency-check-report/
+
+  trivy:
+    name: Aqua Trivy (container)
+    needs: build-push
+    if: inputs.enable_sto_scans
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compute cache day
+        id: day
+        run: echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Trivy database
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/trivy-cache
+          key: trivy-cache-${{ steps.day.outputs.day }}
+          restore-keys: trivy-cache-
+
+      # three passes over the pushed image: full SARIF report, SPDX SBOM (Harness sbom.format
+      # spdx-json), then the fail_on_severity=critical gate last so the reports always exist
+      - name: Scan image
+        env:
+          IMAGE_REF: ${{ inputs.image_repo }}:${{ needs.build-push.outputs.image_tag }}
+          TRIVY_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          TRIVY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          cache_dir="${RUNNER_TEMP}/trivy-cache"
+          report_dir="${GITHUB_WORKSPACE}/trivy-report"
+          mkdir -p "$cache_dir" "$report_dir"
+          trivy() {
+            docker run --rm \
+              --user "$(id -u):$(id -g)" \
+              --env HOME=/tmp \
+              --env TRIVY_USERNAME --env TRIVY_PASSWORD \
+              --volume "${cache_dir}:/cache" \
+              --volume "${report_dir}:/out" \
+              "$TRIVY_IMAGE" image --cache-dir /cache --image-src remote "$@" "$IMAGE_REF"
+          }
+          trivy --format sarif --output /out/trivy.sarif
+          trivy --skip-db-update --format spdx-json --output /out/sbom.spdx.json
+          trivy --skip-db-update --severity CRITICAL --exit-code 1 --format table
+
+      - name: Upload SARIF to Code Scanning
+        if: ${{ !cancelled() && hashFiles('trivy-report/trivy.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: trivy-report/trivy.sarif
+          category: trivy-${{ inputs.service }}
+
+      - name: Upload report and SBOM
+        if: ${{ !cancelled() && hashFiles('trivy-report/*') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trivy-${{ inputs.service }}
+          path: trivy-report/
