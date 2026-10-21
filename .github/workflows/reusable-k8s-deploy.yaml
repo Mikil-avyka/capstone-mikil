@@ -63,11 +63,26 @@ jobs:
         with:
           persist-credentials: false
 
+      # use helm and kubectl already on the runner, as a Harness delegate does, and install them
+      # only when missing. setup-helm cannot unzip on Windows runners without PowerShell 7
+      - name: Check for preinstalled tools
+        id: tools
+        run: |
+          echo "helm=$(command -v helm > /dev/null && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "kubectl=$(command -v kubectl > /dev/null && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
       - name: Set up Helm
+        if: steps.tools.outputs.helm != 'true'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
 
       - name: Set up kubectl
+        if: steps.tools.outputs.kubectl != 'true'
         uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+
+      - name: Show tool versions
+        run: |
+          helm version --short
+          kubectl version --client
 
       # The manifests use Go templating with Harness expressions in values.yaml
       # (<+artifact.imagePath>, <+artifact.tag>). Wrapping them in a throwaway chart and
