@@ -1,0 +1,97 @@
+---
+name: Mikil Deploy
+# GitHub Actions equivalent of the Harness pipeline "mikil_deploy_pipeline":
+#   Approval (user group mikil_approvers, gated by ENABLE_APPROVAL)
+#     -> Deploy Backend  (mikil_backend_deploy_template)
+#     -> Deploy Frontend (mikil_frontend_deploy_template)
+#
+# The approval gate is the GitHub Environment "mikil-approval", whose required reviewers
+# replace the Harness user group.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (Harness mikil_nonprod_env or mikil_prod_env)
+        type: choice
+        options:
+          - mikil-nonprod
+          - mikil-prod
+        required: true
+      backend_tag:
+        description: Backend image tag (mikilavyka/capstone_backend)
+        type: string
+        required: true
+      frontend_tag:
+        description: Frontend image tag (mikilavyka/capstone_frontend)
+        type: string
+        required: true
+      enable_approval:
+        description: Require approval before deploying (ENABLE_APPROVAL)
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      environment:
+        description: Target environment (mikil-nonprod or mikil-prod)
+        type: string
+        required: true
+      backend_tag:
+        description: Backend image tag
+        type: string
+        required: true
+      frontend_tag:
+        description: Frontend image tag
+        type: string
+        required: true
+      enable_approval:
+        description: Require approval before deploying
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  approval:
+    name: Approval
+    if: inputs.enable_approval
+    runs-on: ubuntu-latest
+    # the job waits here until a required reviewer of this environment approves
+    environment: mikil-approval
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Approved
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          BACKEND_TAG: ${{ inputs.backend_tag }}
+          FRONTEND_TAG: ${{ inputs.frontend_tag }}
+        run: echo "Approved deploying backend ${BACKEND_TAG} and frontend ${FRONTEND_TAG} to ${ENVIRONMENT}"
+
+  deploy-backend:
+    name: Deploy Backend
+    needs: approval
+    # run after approval, or straight away when approval is disabled
+    if: ${{ !cancelled() && (needs.approval.result == 'success' || needs.approval.result == 'skipped') }}
+    uses: ./.github/workflows/reusable-k8s-deploy.yaml
+    permissions:
+      contents: read
+    with:
+      service: backend
+      environment: ${{ inputs.environment }}
+      image_repo: mikilavyka/capstone_backend
+      image_tag: ${{ inputs.backend_tag }}
+
+  deploy-frontend:
+    name: Deploy Frontend
+    needs: deploy-backend
+    # explicit check: a skipped approval upstream would otherwise skip this job
+    if: ${{ !cancelled() && needs.deploy-backend.result == 'success' }}
+    uses: ./.github/workflows/reusable-k8s-deploy.yaml
+    permissions:
+      contents: read
+    with:
+      service: frontend
+      environment: ${{ inputs.environment }}
+      image_repo: mikilavyka/capstone_frontend
+      image_tag: ${{ inputs.frontend_tag }}

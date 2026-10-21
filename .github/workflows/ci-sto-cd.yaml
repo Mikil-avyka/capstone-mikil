@@ -1,0 +1,151 @@
+---
+name: Mikil CI-STO-CD
+# GitHub Actions equivalent of the Harness pipeline "mikil_ci_sto_cd":
+#   Build and Scan Backend + Build and Scan Frontend -> Deploy (gated by ENABLE_DEPLOY)
+# with Slack notifications on start, failure and waiting-for-approval.
+#
+# Dispatch inputs that reproduce the Harness input sets:
+#   full_prod     : environment=mikil-prod,    every toggle true
+#   full_nonprod  : environment=mikil-nonprod, every toggle true except enable_approval=false
+#   quick_nonprod : environment=mikil-nonprod, enable_deploy=true, every other toggle false
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (Harness mikil_nonprod_env or mikil_prod_env)
+        type: choice
+        options:
+          - mikil-nonprod
+          - mikil-prod
+        required: true
+      enable_lint:
+        description: Run lint (ENABLE_LINT)
+        type: boolean
+        default: true
+      enable_test:
+        description: Run tests (ENABLE_TEST)
+        type: boolean
+        default: true
+      enable_sto_scans:
+        description: Run Semgrep, OWASP and Trivy scans (ENABLE_STO_SCANS)
+        type: boolean
+        default: true
+      enable_approval:
+        description: Require approval before deploying (ENABLE_APPROVAL)
+        type: boolean
+        default: true
+      enable_deploy:
+        description: Deploy after CI (ENABLE_DEPLOY). Harness forced an explicit choice; off by default here
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  notify-start:
+    name: Notify start
+    runs-on: ubuntu-latest
+    # a Slack outage must never fail the pipeline
+    continue-on-error: true
+    permissions: {}
+    steps:
+      - name: Slack - pipeline started
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then echo "SLACK_WEBHOOK_URL is not set; skipping"; exit 0; fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          text=":rocket: *${GITHUB_WORKFLOW}* #${GITHUB_RUN_NUMBER} started by ${GITHUB_ACTOR} (target: ${ENVIRONMENT}) <${run_url}|View run>"
+          jq -n --arg text "$text" '{text: $text}' \
+            | curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+
+  # Harness ran these stages one after the other; they share nothing, so they run in parallel here
+  backend-ci:
+    name: Build and Scan Backend
+    uses: ./.github/workflows/reusable-node-ci.yaml
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      service: backend
+      image_repo: mikilavyka/capstone_backend
+      enable_lint: ${{ inputs.enable_lint }}
+      enable_test: ${{ inputs.enable_test }}
+      enable_sto_scans: ${{ inputs.enable_sto_scans }}
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+
+  frontend-ci:
+    name: Build and Scan Frontend
+    uses: ./.github/workflows/reusable-node-ci.yaml
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      service: frontend
+      image_repo: mikilavyka/capstone_frontend
+      enable_lint: ${{ inputs.enable_lint }}
+      enable_test: ${{ inputs.enable_test }}
+      enable_sto_scans: ${{ inputs.enable_sto_scans }}
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+
+  # Harness "WaitingForUserAction" notification; runs alongside the approval wait in deploy
+  notify-approval:
+    name: Notify approval pending
+    needs: [backend-ci, frontend-ci]
+    if: inputs.enable_deploy && inputs.enable_approval
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions: {}
+    steps:
+      - name: Slack - waiting for approval
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          BACKEND_TAG: ${{ needs.backend-ci.outputs.image_tag }}
+          FRONTEND_TAG: ${{ needs.frontend-ci.outputs.image_tag }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then echo "SLACK_WEBHOOK_URL is not set; skipping"; exit 0; fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          text=":hourglass_flowing_sand: *${GITHUB_WORKFLOW}* #${GITHUB_RUN_NUMBER} is waiting for approval to deploy backend ${BACKEND_TAG} and frontend ${FRONTEND_TAG} to ${ENVIRONMENT} <${run_url}|Review deployment>"
+          jq -n --arg text "$text" '{text: $text}' \
+            | curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+
+  deploy:
+    name: Deploy
+    needs: [backend-ci, frontend-ci]
+    if: inputs.enable_deploy
+    uses: ./.github/workflows/deploy.yaml
+    permissions:
+      contents: read
+    with:
+      environment: ${{ inputs.environment }}
+      backend_tag: ${{ needs.backend-ci.outputs.image_tag }}
+      frontend_tag: ${{ needs.frontend-ci.outputs.image_tag }}
+      enable_approval: ${{ inputs.enable_approval }}
+
+  # Harness "PipelineFailed" and "StageFailed" notifications, combined into one message
+  notify-failure:
+    name: Notify failure
+    needs: [notify-start, backend-ci, frontend-ci, deploy]
+    if: failure()
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions: {}
+    steps:
+      - name: Slack - pipeline failed
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then echo "SLACK_WEBHOOK_URL is not set; skipping"; exit 0; fi
+          failed="$(jq -r '[to_entries[] | select(.value.result == "failure") | .key] | join(", ")' <<< "$NEEDS")"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          text=":x: *${GITHUB_WORKFLOW}* #${GITHUB_RUN_NUMBER} failed in: ${failed} <${run_url}|View run>"
+          jq -n --arg text "$text" '{text: $text}' \
+            | curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"

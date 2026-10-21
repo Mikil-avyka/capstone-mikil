@@ -1,0 +1,140 @@
+---
+name: Reusable K8s Rolling Deploy
+# GitHub Actions equivalent of the Harness stage templates mikil_backend_deploy_template and
+# mikil_frontend_deploy_template: K8sRollingDeploy (10m timeout, dry run on) with
+# K8sRollingRollback on failure.
+#
+# Runs on a self-hosted runner inside the target cluster, labeled with the environment name.
+# That runner is the counterpart of the Harness delegate: kubectl uses the runner's in-cluster
+# service account or its own kubeconfig, the same as the connector's "InheritFromDelegate".
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Service folder whose k8s/ manifests are deployed (backend or frontend)
+        required: true
+        type: string
+      environment:
+        description: GitHub Environment and self-hosted runner label (mikil-nonprod or mikil-prod)
+        required: true
+        type: string
+      image_repo:
+        description: Image repository (e.g. mikilavyka/capstone_backend)
+        required: true
+        type: string
+      image_tag:
+        description: Image tag to deploy
+        required: true
+        type: string
+      namespace:
+        description: Target namespace (Harness infrastructure definitions use "default")
+        required: false
+        type: string
+        default: default
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: Rolling deploy
+    runs-on: [self-hosted, "${{ inputs.environment }}"]
+    environment:
+      name: ${{ inputs.environment }}
+    # equivalent of the Harness infrastructure setting allowSimultaneousDeployments: false
+    concurrency:
+      group: k8s-deploy-${{ inputs.environment }}-${{ inputs.service }}
+      cancel-in-progress: false
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    # explicit bash so the steps also run on a Windows runner (Git Bash) instead of PowerShell
+    defaults:
+      run:
+        shell: bash
+    env:
+      SERVICE: ${{ inputs.service }}
+      NAMESPACE: ${{ inputs.namespace }}
+      IMAGE_REPO: ${{ inputs.image_repo }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+
+      # The manifests use Go templating with Harness expressions in values.yaml
+      # (<+artifact.imagePath>, <+artifact.tag>). Wrapping them in a throwaway chart and
+      # overriding the image values reproduces Harness's rendering without editing repo files
+      - name: Render manifests
+        run: |
+          chart="${RUNNER_TEMP}/chart-${SERVICE}"
+          rm -rf "$chart"
+          mkdir -p "${chart}/templates"
+          printf 'apiVersion: v2\nname: %s\nversion: 0.0.0\n' "$SERVICE" > "${chart}/Chart.yaml"
+          cp "${SERVICE}/k8s/values.yaml" "${chart}/values.yaml"
+          find "${SERVICE}/k8s" -maxdepth 1 -name '*.yaml' ! -name values.yaml -exec cp {} "${chart}/templates/" \;
+          helm template "$SERVICE" "$chart" \
+            --namespace "$NAMESPACE" \
+            --set-string image.repository="$IMAGE_REPO" \
+            --set-string image.tag="$IMAGE_TAG" \
+            > "${RUNNER_TEMP}/rendered.yaml"
+          echo "RENDERED=${RUNNER_TEMP}/rendered.yaml" >> "$GITHUB_ENV"
+          cat "${RUNNER_TEMP}/rendered.yaml"
+
+      - name: Upload rendered manifests
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rendered-${{ inputs.service }}-${{ inputs.environment }}
+          path: ${{ runner.temp }}/rendered.yaml
+
+      # Harness skipDryRun: false
+      - name: Dry run
+        run: kubectl apply --dry-run=server --namespace "$NAMESPACE" -f "$RENDERED"
+
+      # remember each existing Deployment's revision so a failed rollout can return to it
+      - name: Record current revisions
+        run: |
+          revisions="${RUNNER_TEMP}/previous-revisions.txt"
+          : > "$revisions"
+          for d in $(kubectl get --namespace "$NAMESPACE" -f "$RENDERED" --ignore-not-found -o name | grep '^deployment' || true); do
+            rev="$(kubectl get --namespace "$NAMESPACE" "$d" -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}')"
+            echo "$d $rev" >> "$revisions"
+          done
+          echo "Existing deployments:"
+          cat "$revisions"
+
+      - name: Apply manifests
+        id: apply
+        run: kubectl apply --namespace "$NAMESPACE" -f "$RENDERED"
+
+      - name: Wait for rollout
+        run: |
+          for d in $(kubectl get --namespace "$NAMESPACE" -f "$RENDERED" -o name | grep '^deployment' || true); do
+            kubectl rollout status --namespace "$NAMESPACE" "$d" --timeout=10m
+          done
+
+      # Harness K8sRollingRollback. Only Deployments whose revision moved are reverted; one
+      # that did not exist before this run has no previous release, as in Harness
+      - name: Roll back
+        if: ${{ failure() && steps.apply.outcome != 'skipped' }}
+        run: |
+          revisions="${RUNNER_TEMP}/previous-revisions.txt"
+          if [ ! -s "$revisions" ]; then
+            echo "No previous release to roll back to"
+            exit 0
+          fi
+          while read -r d rev; do
+            current="$(kubectl get --namespace "$NAMESPACE" "$d" -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}')"
+            if [ -n "$rev" ] && [ "$current" != "$rev" ]; then
+              echo "Rolling back $d from revision $current to $rev"
+              kubectl rollout undo --namespace "$NAMESPACE" "$d" --to-revision="$rev"
+              kubectl rollout status --namespace "$NAMESPACE" "$d" --timeout=10m
+            fi
+          done < "$revisions"

@@ -1,0 +1,52 @@
+---
+name: Mikil Backend CI
+# GitHub Actions equivalent of the Harness pipeline "Mikil Backend CI" (mikil_backend_ci)
+# and its trigger "mikil_backend_trigger", which ran on a PR merged into main with every
+# toggle enabled (input set "full_scan_inputset").
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - backend/**
+      - .github/workflows/backend-ci.yaml
+      - .github/workflows/reusable-node-ci.yaml
+  workflow_dispatch:
+    inputs:
+      enable_lint:
+        description: Run lint (ENABLE_LINT)
+        type: boolean
+        default: true
+      enable_test:
+        description: Run tests (ENABLE_TEST)
+        type: boolean
+        default: true
+      enable_sto_scans:
+        description: Run Semgrep, OWASP and Trivy scans (ENABLE_STO_SCANS)
+        type: boolean
+        default: true
+      image_tag:
+        description: Image tag (default is backend-<run number>-<short sha>)
+        type: string
+        required: false
+
+permissions: {}
+
+jobs:
+  backend:
+    name: Backend
+    uses: ./.github/workflows/reusable-node-ci.yaml
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      service: backend
+      image_repo: mikilavyka/capstone_backend
+      # push events have no inputs, so every toggle defaults to on like the Harness trigger
+      enable_lint: ${{ github.event_name != 'workflow_dispatch' || inputs.enable_lint }}
+      enable_test: ${{ github.event_name != 'workflow_dispatch' || inputs.enable_test }}
+      enable_sto_scans: ${{ github.event_name != 'workflow_dispatch' || inputs.enable_sto_scans }}
+      image_tag: ${{ inputs.image_tag || '' }}
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
