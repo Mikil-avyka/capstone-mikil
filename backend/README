@@ -1,0 +1,9 @@
+1. Install node version 18 or 20.
+2. Open a new terminal.
+3. Run "npm install".
+4. Run "npm run lint" for linting.
+5. Run "npm test" to run tests.
+6. Run "node server.js" to start the server on port 5000.
+
+Note - Start backend before frontend.
+       For frontend clone the repo and run the code using the steps in the README file.

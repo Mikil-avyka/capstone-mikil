@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mikil-backend
+  labels:
+    app: mikil-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mikil-backend
+  template:
+    metadata:
+      labels:
+        app: mikil-backend
+    spec:
+      containers:
+        - name: backend
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: 5000
+
+          env:
+            - name: PORT
+              value: "5000"
+
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          volumeMounts:
+            - name: data-volume
+              mountPath: /app/data
+
+      volumes:
+        - name: data-volume
+          emptyDir: {}

@@ -1,0 +1,6 @@
+image:
+  repository: <+artifact.imagePath>
+  tag: <+artifact.tag>
+
+replicaCount: 1
+containerPort: 3000
